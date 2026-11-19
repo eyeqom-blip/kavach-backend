@@ -597,4 +597,12 @@ app.get('/api/debug-bot', async (req, res) => {
   res.json({ hasToken: Boolean(BOT_TOKEN), adminChatIdLen: ADMIN_CHAT_ID.length, webhook: info });
 });
 
-app.listen(PORT, () => console.log(`Kavach Backend running on port ${PORT}`));
+app.get('/api/fix-webhook', async (req, res) => {
+  const r = await tgCall('setWebhook', { url: 'https://kavach-backend-8hjz.onrender.com/telegram-webhook' });
+  res.json(r);
+});
+
+app.listen(PORT, () => {
+  console.log(`Kavach Backend running on port ${PORT}`);
+  tgCall('setWebhook', { url: 'https://kavach-backend-8hjz.onrender.com/telegram-webhook' });
+});
