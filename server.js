@@ -44,7 +44,6 @@ async function sendTgPhotoBase64(chatId, base64Img, caption, replyMarkup) {
   });
 }
 
-// 1. Health Check
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -54,7 +53,6 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// 2. Dynamic App Config
 app.get('/api/config', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT key, value FROM app_config');
@@ -66,21 +64,36 @@ app.get('/api/config', async (req, res) => {
   }
 });
 
-// 3. Register / Login & Family (Flexible Max Members)
+// Login / Signup with Referral Code Support
 app.post('/api/auth/login', async (req, res) => {
-  const { name, phone, email, deviceId, inviteCode } = req.body;
+  const { name, phone, email, deviceId, inviteCode, referralCode } = req.body;
   if (!name || !phone || !deviceId) {
     return res.status(400).json({ success: false, message: 'Name, Phone & Device ID required' });
   }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    let referrerId = null;
+    if (referralCode && referralCode.trim().isNotEmpty !== false && referralCode.trim().length > 0) {
+      const refRes = await client.query('SELECT id, phone FROM users WHERE referral_code = $1', [referralCode.trim().toUpperCase()]);
+      if (refRes.rows.length > 0 && refRes.rows[0].phone !== phone) {
+        referrerId = refRes.rows[0].id;
+      }
+    }
+
+    const genRef = 'REF' + Math.random().toString(36).substring(2, 7).toUpperCase();
     const userRes = await client.query(
-      `INSERT INTO users (name, phone, email, device_id)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (phone) DO UPDATE SET name = $1, email = COALESCE($3, users.email), device_id = $4
+      `INSERT INTO users (name, phone, email, device_id, referral_code, referred_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (phone) DO UPDATE SET
+         name = $1,
+         email = COALESCE($3, users.email),
+         device_id = $4,
+         referral_code = COALESCE(users.referral_code, $5),
+         referred_by = COALESCE(users.referred_by, $6)
        RETURNING *`,
-      [name, phone, email || null, deviceId]
+      [name, phone, email || null, deviceId, genRef, referrerId]
     );
     const user = userRes.rows[0];
 
@@ -133,7 +146,34 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// 4. Family Plan & Member Count Status
+// Referral Dashboard Endpoint
+app.get('/api/referrals/:userId', async (req, res) => {
+  try {
+    const uRes = await pool.query('SELECT id, referral_code, discount_credits FROM users WHERE id = $1', [req.params.userId]);
+    if (uRes.rows.length === 0) return res.status(404).json({ success: false });
+
+    const friendsRes = await pool.query(
+      `SELECT u.id, u.name,
+              CONCAT(LEFT(u.phone, 2), '******', RIGHT(u.phone, 2)) AS masked_phone,
+              COALESCE((SELECT s.status FROM subscriptions s WHERE s.user_id = u.id ORDER BY s.created_at DESC LIMIT 1), 'NOT_PAID') AS plan_status
+       FROM users u
+       WHERE u.referred_by = $1
+       ORDER BY u.created_at DESC`,
+      [req.params.userId]
+    );
+
+    res.json({
+      success: true,
+      referral_code: uRes.rows[0].referral_code,
+      discount_credits: uRes.rows[0].discount_credits || 0,
+      referred_friends: friendsRes.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Family Plan & Credits Status
 app.get('/api/family/:familyId/status', async (req, res) => {
   try {
     const fam = await pool.query('SELECT * FROM families WHERE id = $1', [req.params.familyId]);
@@ -144,10 +184,14 @@ app.get('/api/family/:familyId/status', async (req, res) => {
       `SELECT * FROM subscriptions WHERE family_id = $1 ORDER BY created_at DESC LIMIT 1`,
       [req.params.familyId]
     );
+    const ownerCredits = await pool.query('SELECT discount_credits, referral_code FROM users WHERE id = $1', [fam.rows[0].owner_id]);
+
     res.json({
       success: true,
       max_members: fam.rows[0].max_members,
       current_members: parseInt(cnt.rows[0].count),
+      discount_credits: ownerCredits.rows[0]?.discount_credits || 0,
+      referral_code: ownerCredits.rows[0]?.referral_code || '',
       subscription: sub.rows[0] || null,
     });
   } catch (err) {
@@ -155,30 +199,34 @@ app.get('/api/family/:familyId/status', async (req, res) => {
   }
 });
 
-// 5. Submit Payment (5 default = 20/80, Extra member = +5/mo or +20/6mo)
+// Submit Payment with Referral Discount Calculation
 app.post('/api/payment/submit', async (req, res) => {
   const { familyId, userId, planType, requestedMembers, utrNumber, screenshotBase64 } = req.body;
   const members = Math.max(5, parseInt(requestedMembers || 5, 10));
   const extra = members - 5;
-  const amount = planType === '6_MONTHS' ? (80 + extra * 20) : (20 + extra * 5);
+  const baseAmount = planType === '6_MONTHS' ? (80 + extra * 20) : (20 + extra * 5);
 
   try {
+    const userRes = await pool.query('SELECT name, phone, discount_credits FROM users WHERE id = $1', [userId]);
+    const u = userRes.rows[0] || { name: 'Unknown', phone: 'N/A', discount_credits: 0 };
+    const availableCredits = u.discount_credits || 0;
+    const discountUsed = Math.min(availableCredits, baseAmount);
+    const finalAmount = baseAmount - discountUsed;
+
     const subRes = await pool.query(
-      `INSERT INTO subscriptions (family_id, user_id, plan_type, amount, payment_source, tx_ref, status, requested_members)
-       VALUES ($1, $2, $3, $4, 'MANUAL_UPI', $5, 'PENDING', $6) RETURNING *`,
-      [familyId, userId, planType, amount, utrNumber, members]
+      `INSERT INTO subscriptions (family_id, user_id, plan_type, amount, payment_source, tx_ref, status, requested_members, discount_used)
+       VALUES ($1, $2, $3, $4, 'MANUAL_UPI', $5, 'PENDING', $6, $7) RETURNING *`,
+      [familyId, userId, planType, finalAmount, utrNumber || 'CREDIT_CLAIM', members, discountUsed]
     );
     const sub = subRes.rows[0];
-
-    const userRes = await pool.query('SELECT name, phone FROM users WHERE id = $1', [userId]);
-    const u = userRes.rows[0] || { name: 'Unknown', phone: 'N/A' };
 
     const caption =
       `💰 <b>New Kavach Payment Request!</b>\n\n` +
       `👤 User: ${u.name} (${u.phone})\n` +
       `🏠 Family ID: #${familyId}\n` +
-      `👥 Members Limit: <b>${members} Persons</b> (5 + ${extra} extra)\n` +
-      `📦 Plan: <b>${planType} (₹${amount})</b>\n` +
+      `👥 Members Limit: <b>${members} Persons</b>\n` +
+      `💵 Base Price: ₹${baseAmount} | 🎟️ Referral Discount: -₹${discountUsed}\n` +
+      `📦 Payable Paid: <b>${planType} (₹${finalAmount})</b>\n` +
       `🧾 UTR/Ref: <code>${utrNumber}</code>\n` +
       `🆔 Sub ID: #${sub.id}`;
 
@@ -202,13 +250,13 @@ app.post('/api/payment/submit', async (req, res) => {
       });
     }
 
-    res.json({ success: true, message: 'Payment submitted! Telegram par approval pending.', subscription: sub });
+    res.json({ success: true, message: 'Payment submitted! Admin approval pending.', subscription: sub });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 6. Location & SOS Endpoints
+// Location & SOS Endpoints
 app.post('/api/location/update', async (req, res) => {
   const { userId, latitude, longitude, batteryLevel, isCharging } = req.body;
   try {
@@ -265,7 +313,7 @@ app.get('/api/family/:familyId/alerts', async (req, res) => {
   }
 });
 
-// 7. GitHub Actions -> Telegram 3-Option Release Control!
+// GitHub Actions -> Telegram 3-Option Release Control
 app.post('/api/admin/new-build', async (req, res) => {
   const { version, apkUrl, notes, secret } = req.body;
   if (secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
@@ -300,7 +348,7 @@ app.post('/api/admin/new-build', async (req, res) => {
   }
 });
 
-// 8. Telegram Webhook (Payments + 3-Button Releases + Admin Commands)
+// Telegram Webhook
 app.post('/telegram-webhook', async (req, res) => {
   res.sendStatus(200);
   const update = req.body;
@@ -311,7 +359,6 @@ app.post('/telegram-webhook', async (req, res) => {
       if (String(cq.from.id) !== String(ADMIN_CHAT_ID)) return;
       const data = cq.data;
 
-      // Release 3-Option Handlers
       if (data.startsWith('rel_')) {
         const [, action, relId] = data.split('_');
         const relRes = await pool.query('SELECT * FROM app_releases WHERE id = $1', [relId]);
@@ -353,13 +400,12 @@ app.post('/telegram-webhook', async (req, res) => {
         return;
       }
 
-      // Payment Handlers
       const [action, subId] = data.split('_');
       const subRes = await pool.query('SELECT * FROM subscriptions WHERE id = $1', [subId]);
       if (subRes.rows.length === 0) return;
       const sub = subRes.rows[0];
 
-      if (action === 'approve') {
+      if (action === 'approve' && sub.status !== 'ACTIVE') {
         const days = sub.plan_type === '6_MONTHS' ? 180 : 30;
         await pool.query(
           `UPDATE subscriptions SET status = 'ACTIVE', valid_until = NOW() + INTERVAL '${days} days' WHERE id = $1`,
@@ -369,10 +415,28 @@ app.post('/telegram-webhook', async (req, res) => {
           `UPDATE families SET max_members = GREATEST(max_members, $1) WHERE id = $2`,
           [sub.requested_members || 5, sub.family_id]
         );
+
+        // 1. Deduct discount credits used by this user
+        if ((sub.discount_used || 0) > 0) {
+          await pool.query(
+            `UPDATE users SET discount_credits = GREATEST(0, discount_credits - $1) WHERE id = $2`,
+            [sub.discount_used, sub.user_id]
+          );
+        }
+
+        // 2. Give +1 Rupee Recurring Credit to Referrer (on First Payment & Every Renewal!)
+        const payerRes = await pool.query('SELECT referred_by FROM users WHERE id = $1', [sub.user_id]);
+        const refBy = payerRes.rows[0]?.referred_by;
+        if (refBy && refBy !== sub.user_id) {
+          await pool.query(`UPDATE users SET discount_credits = discount_credits + 1 WHERE id = $1`, [refBy]);
+        }
+
         await tgCall('editMessageReplyMarkup', {
           chat_id: cq.message.chat.id,
           message_id: cq.message.message_id,
-          reply_markup: { inline_keyboard: [[{ text: `✅ APPROVED (${sub.requested_members || 5} Members)`, callback_data: 'done' }]] },
+          reply_markup: {
+            inline_keyboard: [[{ text: `✅ APPROVED (${sub.requested_members || 5} Members${refBy ? ' +₹1 Ref!' : ''})`, callback_data: 'done' }]],
+          },
         });
       } else if (action === 'reject') {
         await pool.query(`UPDATE subscriptions SET status = 'REJECTED' WHERE id = $1`, [subId]);
