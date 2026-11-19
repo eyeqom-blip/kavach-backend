@@ -570,6 +570,19 @@ app.post('/telegram-webhook', async (req, res) => {
           text: `📊 <b>Family Kavach Stats</b>\n\n👥 Users: ${u.rows[0].count}\n🏠 Families: ${f.rows[0].count}\n💎 Active Paid: ${a.rows[0].count}`,
           parse_mode: 'HTML',
         });
+      } else if (text === '/help' || text === '/start') {
+        await tgCall('sendMessage', {
+          chat_id: ADMIN_CHAT_ID,
+          text:
+            `🛡️ <b>Family Kavach Admin Cheatsheet</b>\n\n` +
+            `📊 <code>/stats</code> - Live Users, Families & Paid Plans\n` +
+            `💳 <code>/setupi id@upi</code> - Owner UPI ID badlein\n` +
+            `📢 <code>/broadcast Message</code> - App Open Popup bhejein\n` +
+            `🔄 <code>/mode_pg</code> - PhonePe PG Autopay ON karein\n` +
+            `🔄 <code>/mode_upi</code> - Owner Manual UPI ON karein\n` +
+            `ℹ️ <code>/help</code> - Ye list dobara dekhein`,
+          parse_mode: 'HTML',
+        });
       } else if (text.startsWith('/setupi ')) {
         const newUpi = text.replace('/setupi ', '').trim();
         await pool.query(`UPDATE app_config SET value = $1 WHERE key = 'upi_id'`, [newUpi]);
@@ -597,6 +610,34 @@ app.get('/api/debug-bot', async (req, res) => {
   res.json({ hasToken: Boolean(BOT_TOKEN), adminChatIdLen: ADMIN_CHAT_ID.length, webhook: info });
 });
 
+app.get('/api/cron/daily-report', async (req, res) => {
+  if (req.query.secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
+  try {
+    const u = await pool.query('SELECT COUNT(*) FROM users');
+    const f = await pool.query('SELECT COUNT(*) FROM families');
+    const a = await pool.query("SELECT COUNT(*) FROM subscriptions WHERE status = 'ACTIVE' AND valid_until > NOW()");
+    const p = await pool.query("SELECT COUNT(*) FROM subscriptions WHERE status = 'PENDING'");
+    const rev = await pool.query("SELECT COALESCE(SUM(amount), 0) AS total FROM subscriptions WHERE status = 'ACTIVE' AND created_at >= NOW() - INTERVAL '24 hours'");
+    const sos = await pool.query("SELECT COUNT(*) FROM sos_alerts WHERE created_at >= NOW() - INTERVAL '24 hours'");
+
+    await tgCall('sendMessage', {
+      chat_id: ADMIN_CHAT_ID,
+      text:
+        `☀️ <b>Good Morning! Daily Kavach Report (10 AM)</b>\n\n` +
+        `👥 Total Users: <b>${u.rows[0].count}</b>\n` +
+        `🏠 Total Families: <b>${f.rows[0].count}</b>\n` +
+        `💎 Active Paid Plans: <b>${a.rows[0].count}</b>\n` +
+        `⏳ Pending Approvals: <b>${p.rows[0].count}</b>\n` +
+        `💰 Last 24h Revenue: <b>₹${rev.rows[0].total}</b>\n` +
+        `🚨 Last 24h SOS Alerts: <b>${sos.rows[0].count}</b>`,
+      parse_mode: 'HTML',
+    });
+    res.json({ success: true, sent: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/fix-webhook', async (req, res) => {
   const r = await tgCall('setWebhook', { url: 'https://kavach-backend-8hjz.onrender.com/telegram-webhook' });
   res.json(r);
@@ -605,4 +646,14 @@ app.get('/api/fix-webhook', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Kavach Backend running on port ${PORT}`);
   tgCall('setWebhook', { url: 'https://kavach-backend-8hjz.onrender.com/telegram-webhook' });
+  tgCall('setMyCommands', {
+    commands: [
+      { command: 'stats', description: 'Live Users, Families & Paid Count' },
+      { command: 'help', description: 'Admin Commands Cheatsheet' },
+      { command: 'setupi', description: 'Change UPI (/setupi id@upi)' },
+      { command: 'broadcast', description: 'Send App Popup (/broadcast msg)' },
+      { command: 'mode_pg', description: 'Switch to PhonePe PG Autopay' },
+      { command: 'mode_upi', description: 'Switch to Owner Manual UPI' }
+    ]
+  });
 });
