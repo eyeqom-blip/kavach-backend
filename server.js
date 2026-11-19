@@ -5,7 +5,7 @@ const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '15mb' }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -36,7 +36,7 @@ async function sendTgPhotoBase64(chatId, base64Img, caption, replyMarkup) {
   form.append('caption', caption);
   form.append('parse_mode', 'HTML');
   if (replyMarkup) form.append('reply_markup', JSON.stringify(replyMarkup));
-  form.append('photo', new Blob([buffer], { type: 'image/jpeg' }), 'receipt.jpg');
+  form.append('photo', new Blob([buffer], { type: 'image/jpeg' }), 'photo.jpg');
 
   await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
     method: 'POST',
@@ -75,7 +75,7 @@ app.post('/api/auth/login', async (req, res) => {
     await client.query('BEGIN');
 
     let referrerId = null;
-    if (referralCode && referralCode.trim().isNotEmpty !== false && referralCode.trim().length > 0) {
+    if (referralCode && referralCode.trim().length > 0) {
       const refRes = await client.query('SELECT id, phone FROM users WHERE referral_code = $1', [referralCode.trim().toUpperCase()]);
       if (refRes.rows.length > 0 && refRes.rows[0].phone !== phone) {
         referrerId = refRes.rows[0].id;
@@ -125,7 +125,7 @@ app.post('/api/auth/login', async (req, res) => {
       } else {
         const code = 'KVC' + Math.random().toString(36).substring(2, 7).toUpperCase();
         const newFam = await client.query(
-          'INSERT INTO families (owner_id, invite_code, max_members) VALUES ($1, $2, 5) RETURNING *',
+          'INSERT INTO families (owner_id, invite_code, max_members, max_pro_guard) VALUES ($1, $2, 5, 0) RETURNING *',
           [user.id, code]
         );
         family = newFam.rows[0];
@@ -146,7 +146,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Referral Dashboard Endpoint
+// Referral Dashboard
 app.get('/api/referrals/:userId', async (req, res) => {
   try {
     const uRes = await pool.query('SELECT id, referral_code, discount_credits FROM users WHERE id = $1', [req.params.userId]);
@@ -156,9 +156,7 @@ app.get('/api/referrals/:userId', async (req, res) => {
       `SELECT u.id, u.name,
               CONCAT(LEFT(u.phone, 2), '******', RIGHT(u.phone, 2)) AS masked_phone,
               COALESCE((SELECT s.status FROM subscriptions s WHERE s.user_id = u.id ORDER BY s.created_at DESC LIMIT 1), 'NOT_PAID') AS plan_status
-       FROM users u
-       WHERE u.referred_by = $1
-       ORDER BY u.created_at DESC`,
+       FROM users u WHERE u.referred_by = $1 ORDER BY u.created_at DESC`,
       [req.params.userId]
     );
 
@@ -173,13 +171,17 @@ app.get('/api/referrals/:userId', async (req, res) => {
   }
 });
 
-// Family Plan & Credits Status
+// Family Plan, Pro Guard Slots & Member Toggles
 app.get('/api/family/:familyId/status', async (req, res) => {
   try {
     const fam = await pool.query('SELECT * FROM families WHERE id = $1', [req.params.familyId]);
     if (fam.rows.length === 0) return res.status(404).json({ success: false });
 
-    const cnt = await pool.query('SELECT COUNT(*) FROM family_members WHERE family_id = $1', [req.params.familyId]);
+    const membersRes = await pool.query(
+      `SELECT u.id, u.name, u.phone, fm.role, fm.pro_guard_enabled
+       FROM family_members fm JOIN users u ON fm.user_id = u.id WHERE fm.family_id = $1 ORDER BY fm.id ASC`,
+      [req.params.familyId]
+    );
     const sub = await pool.query(
       `SELECT * FROM subscriptions WHERE family_id = $1 ORDER BY created_at DESC LIMIT 1`,
       [req.params.familyId]
@@ -189,7 +191,9 @@ app.get('/api/family/:familyId/status', async (req, res) => {
     res.json({
       success: true,
       max_members: fam.rows[0].max_members,
-      current_members: parseInt(cnt.rows[0].count),
+      max_pro_guard: fam.rows[0].max_pro_guard || 0,
+      current_members: membersRes.rows.length,
+      members: membersRes.rows,
       discount_credits: ownerCredits.rows[0]?.discount_credits || 0,
       referral_code: ownerCredits.rows[0]?.referral_code || '',
       subscription: sub.rows[0] || null,
@@ -199,24 +203,58 @@ app.get('/api/family/:familyId/status', async (req, res) => {
   }
 });
 
-// Submit Payment with Referral Discount Calculation
+// Toggle Person-Wise Pro Guard (Call Log / Hidden Apps / Anti-Theft)
+app.post('/api/family/:familyId/pro-guard/toggle', async (req, res) => {
+  const { targetUserId, enable } = req.body;
+  try {
+    const fam = await pool.query('SELECT max_pro_guard FROM families WHERE id = $1', [req.params.familyId]);
+    const maxPro = fam.rows[0]?.max_pro_guard || 0;
+
+    if (enable) {
+      const used = await pool.query(
+        'SELECT COUNT(*) FROM family_members WHERE family_id = $1 AND pro_guard_enabled = TRUE',
+        [req.params.familyId]
+      );
+      if (parseInt(used.rows[0].count) >= maxPro) {
+        return res.status(400).json({
+          success: false,
+          message: `Aapke paas ${maxPro} Pro Guard slots hain. Pay / Add me ja kar person add karein!`,
+        });
+      }
+    }
+
+    await pool.query(
+      'UPDATE family_members SET pro_guard_enabled = $1 WHERE family_id = $2 AND user_id = $3',
+      [Boolean(enable), req.params.familyId, targetUserId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Submit Payment (Base 5=20/80 + Extra 5/20 + Pro Guard Add-On 10/35 per person)
 app.post('/api/payment/submit', async (req, res) => {
-  const { familyId, userId, planType, requestedMembers, utrNumber, screenshotBase64 } = req.body;
-  const members = Math.max(5, parseInt(requestedMembers || 5, 10));
+  const { familyId, userId, planType, requestedMembers, proGuardCount, utrNumber, screenshotBase64 } = req.body;
+  const members = Math.max(5, Math.min(20, parseInt(requestedMembers || 5, 10)));
   const extra = members - 5;
-  const baseAmount = planType === '6_MONTHS' ? (80 + extra * 20) : (20 + extra * 5);
+  const proCount = Math.max(0, Math.min(members, parseInt(proGuardCount || 0, 10)));
+
+  const baseAmount =
+    planType === '6_MONTHS'
+      ? 80 + extra * 20 + proCount * 35
+      : 20 + extra * 5 + proCount * 10;
 
   try {
     const userRes = await pool.query('SELECT name, phone, discount_credits FROM users WHERE id = $1', [userId]);
     const u = userRes.rows[0] || { name: 'Unknown', phone: 'N/A', discount_credits: 0 };
-    const availableCredits = u.discount_credits || 0;
-    const discountUsed = Math.min(availableCredits, baseAmount);
+    const discountUsed = Math.min(u.discount_credits || 0, baseAmount);
     const finalAmount = baseAmount - discountUsed;
 
     const subRes = await pool.query(
-      `INSERT INTO subscriptions (family_id, user_id, plan_type, amount, payment_source, tx_ref, status, requested_members, discount_used)
-       VALUES ($1, $2, $3, $4, 'MANUAL_UPI', $5, 'PENDING', $6, $7) RETURNING *`,
-      [familyId, userId, planType, finalAmount, utrNumber || 'CREDIT_CLAIM', members, discountUsed]
+      `INSERT INTO subscriptions (family_id, user_id, plan_type, amount, payment_source, tx_ref, status, requested_members, pro_guard_count, discount_used)
+       VALUES ($1, $2, $3, $4, 'MANUAL_UPI', $5, 'PENDING', $6, $7, $8) RETURNING *`,
+      [familyId, userId, planType, finalAmount, utrNumber || 'CREDIT_CLAIM', members, proCount, discountUsed]
     );
     const sub = subRes.rows[0];
 
@@ -224,30 +262,23 @@ app.post('/api/payment/submit', async (req, res) => {
       `💰 <b>New Kavach Payment Request!</b>\n\n` +
       `👤 User: ${u.name} (${u.phone})\n` +
       `🏠 Family ID: #${familyId}\n` +
-      `👥 Members Limit: <b>${members} Persons</b>\n` +
-      `💵 Base Price: ₹${baseAmount} | 🎟️ Referral Discount: -₹${discountUsed}\n` +
-      `📦 Payable Paid: <b>${planType} (₹${finalAmount})</b>\n` +
+      `👥 Members: <b>${members}</b> | 🛡️ Pro Guard Slots: <b>${proCount}</b>\n` +
+      `💵 Base: ₹${baseAmount} | 🎟️ Referral: -₹${discountUsed}\n` +
+      `📦 Payable: <b>${planType} (₹${finalAmount})</b>\n` +
       `🧾 UTR/Ref: <code>${utrNumber}</code>\n` +
       `🆔 Sub ID: #${sub.id}`;
 
     const replyMarkup = {
-      inline_keyboard: [
-        [
-          { text: '✅ Approve Plan', callback_data: `approve_${sub.id}` },
-          { text: '❌ Reject', callback_data: `reject_${sub.id}` },
-        ],
-      ],
+      inline_keyboard: [[
+        { text: '✅ Approve Plan', callback_data: `approve_${sub.id}` },
+        { text: '❌ Reject', callback_data: `reject_${sub.id}` },
+      ]],
     };
 
     if (screenshotBase64) {
       await sendTgPhotoBase64(ADMIN_CHAT_ID, screenshotBase64, caption, replyMarkup);
     } else {
-      await tgCall('sendMessage', {
-        chat_id: ADMIN_CHAT_ID,
-        text: caption,
-        parse_mode: 'HTML',
-        reply_markup: replyMarkup,
-      });
+      await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: caption, parse_mode: 'HTML', reply_markup: replyMarkup });
     }
 
     res.json({ success: true, message: 'Payment submitted! Admin approval pending.', subscription: sub });
@@ -256,7 +287,7 @@ app.post('/api/payment/submit', async (req, res) => {
   }
 });
 
-// Location & SOS Endpoints
+// Location & SOS
 app.post('/api/location/update', async (req, res) => {
   const { userId, latitude, longitude, batteryLevel, isCharging } = req.body;
   try {
@@ -273,12 +304,10 @@ app.post('/api/location/update', async (req, res) => {
 app.get('/api/family/:familyId/locations', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT DISTINCT ON (u.id) u.id, u.name, u.phone, fm.role, l.latitude, l.longitude, l.battery_level, l.is_charging, l.recorded_at
-       FROM family_members fm
-       JOIN users u ON fm.user_id = u.id
+      `SELECT DISTINCT ON (u.id) u.id, u.name, u.phone, fm.role, fm.pro_guard_enabled, l.latitude, l.longitude, l.battery_level, l.is_charging, l.recorded_at
+       FROM family_members fm JOIN users u ON fm.user_id = u.id
        LEFT JOIN locations l ON u.id = l.user_id
-       WHERE fm.family_id = $1
-       ORDER BY u.id, l.recorded_at DESC`,
+       WHERE fm.family_id = $1 ORDER BY u.id, l.recorded_at DESC`,
       [req.params.familyId]
     );
     res.json({ success: true, members: rows });
@@ -308,6 +337,96 @@ app.get('/api/family/:familyId/alerts', async (req, res) => {
       [req.params.familyId]
     );
     res.json({ success: true, alerts: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Phase 4: E2EE Family Chat (Server sirf encrypted ciphertext store karta hai!)
+app.post('/api/chat/send', async (req, res) => {
+  const { familyId, senderId, ciphertext, iv } = req.body;
+  try {
+    const r = await pool.query(
+      'INSERT INTO encrypted_messages (family_id, sender_id, ciphertext, iv) VALUES ($1, $2, $3, $4) RETURNING *',
+      [familyId, senderId, ciphertext, iv]
+    );
+    res.json({ success: true, message: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/chat/:familyId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.*, u.name as sender_name FROM encrypted_messages m JOIN users u ON m.sender_id = u.id
+       WHERE m.family_id = $1 ORDER BY m.created_at DESC LIMIT 50`,
+      [req.params.familyId]
+    );
+    res.json({ success: true, messages: rows.reverse() });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Phase 4: Shared Family Tasks & Calendar
+app.get('/api/tasks/:familyId', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM family_tasks WHERE family_id = $1 ORDER BY is_done ASC, id DESC', [req.params.familyId]);
+    res.json({ success: true, tasks: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/tasks/add', async (req, res) => {
+  const { familyId, title, dueDate, assignedTo } = req.body;
+  try {
+    const r = await pool.query(
+      'INSERT INTO family_tasks (family_id, title, due_date, assigned_to) VALUES ($1, $2, $3, $4) RETURNING *',
+      [familyId, title, dueDate || '', assignedTo || 'Everyone']
+    );
+    res.json({ success: true, task: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/tasks/toggle', async (req, res) => {
+  const { taskId, isDone } = req.body;
+  try {
+    await pool.query('UPDATE family_tasks SET is_done = $1 WHERE id = $2', [Boolean(isDone), taskId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Phase 4: Kids Activity & Anti-Theft Reports
+app.post('/api/reports/submit', async (req, res) => {
+  const { familyId, userId, reportType, details, photoBase64 } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO child_reports (family_id, user_id, report_type, details) VALUES ($1, $2, $3, $4)',
+      [familyId, userId, reportType, details]
+    );
+    if (photoBase64) {
+      await sendTgPhotoBase64(ADMIN_CHAT_ID, photoBase64, `🚨 <b>Kavach Anti-Theft Capture</b>\nFamily #${familyId} | ${reportType}\n${details}`);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/reports/:familyId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT r.*, u.name as user_name FROM child_reports r JOIN users u ON r.user_id = u.id
+       WHERE r.family_id = $1 ORDER BY r.created_at DESC LIMIT 30`,
+      [req.params.familyId]
+    );
+    res.json({ success: true, reports: rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -407,24 +526,15 @@ app.post('/telegram-webhook', async (req, res) => {
 
       if (action === 'approve' && sub.status !== 'ACTIVE') {
         const days = sub.plan_type === '6_MONTHS' ? 180 : 30;
+        await pool.query(`UPDATE subscriptions SET status = 'ACTIVE', valid_until = NOW() + INTERVAL '${days} days' WHERE id = $1`, [subId]);
         await pool.query(
-          `UPDATE subscriptions SET status = 'ACTIVE', valid_until = NOW() + INTERVAL '${days} days' WHERE id = $1`,
-          [subId]
-        );
-        await pool.query(
-          `UPDATE families SET max_members = GREATEST(max_members, $1) WHERE id = $2`,
-          [sub.requested_members || 5, sub.family_id]
+          `UPDATE families SET max_members = GREATEST(max_members, $1), max_pro_guard = GREATEST(max_pro_guard, $2) WHERE id = $3`,
+          [sub.requested_members || 5, sub.pro_guard_count || 0, sub.family_id]
         );
 
-        // 1. Deduct discount credits used by this user
         if ((sub.discount_used || 0) > 0) {
-          await pool.query(
-            `UPDATE users SET discount_credits = GREATEST(0, discount_credits - $1) WHERE id = $2`,
-            [sub.discount_used, sub.user_id]
-          );
+          await pool.query(`UPDATE users SET discount_credits = GREATEST(0, discount_credits - $1) WHERE id = $2`, [sub.discount_used, sub.user_id]);
         }
-
-        // 2. Give +1 Rupee Recurring Credit to Referrer (on First Payment & Every Renewal!)
         const payerRes = await pool.query('SELECT referred_by FROM users WHERE id = $1', [sub.user_id]);
         const refBy = payerRes.rows[0]?.referred_by;
         if (refBy && refBy !== sub.user_id) {
@@ -435,7 +545,7 @@ app.post('/telegram-webhook', async (req, res) => {
           chat_id: cq.message.chat.id,
           message_id: cq.message.message_id,
           reply_markup: {
-            inline_keyboard: [[{ text: `✅ APPROVED (${sub.requested_members || 5} Members${refBy ? ' +₹1 Ref!' : ''})`, callback_data: 'done' }]],
+            inline_keyboard: [[{ text: `✅ APPROVED (${sub.requested_members}M + ${sub.pro_guard_count || 0}Pro)`, callback_data: 'done' }]],
           },
         });
       } else if (action === 'reject') {
@@ -457,23 +567,23 @@ app.post('/telegram-webhook', async (req, res) => {
         const a = await pool.query(`SELECT COUNT(*) FROM subscriptions WHERE status = 'ACTIVE' AND valid_until > NOW()`);
         await tgCall('sendMessage', {
           chat_id: ADMIN_CHAT_ID,
-          text: `📊 <b>Family Kavach Stats</b>\n\n👥 Total Users: ${u.rows[0].count}\n🏠 Total Families: ${f.rows[0].count}\n💎 Active Paid Plans: ${a.rows[0].count}`,
+          text: `📊 <b>Family Kavach Stats</b>\n\n👥 Users: ${u.rows[0].count}\n🏠 Families: ${f.rows[0].count}\n💎 Active Paid: ${a.rows[0].count}`,
           parse_mode: 'HTML',
         });
       } else if (text.startsWith('/setupi ')) {
         const newUpi = text.replace('/setupi ', '').trim();
         await pool.query(`UPDATE app_config SET value = $1 WHERE key = 'upi_id'`, [newUpi]);
-        await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `✅ UPI ID updated to: ${newUpi}` });
+        await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `✅ UPI ID updated: ${newUpi}` });
       } else if (text.startsWith('/broadcast ')) {
         const msg = text.replace('/broadcast ', '').trim();
         await pool.query(`UPDATE app_config SET value = $1 WHERE key = 'announcement'`, [msg]);
         await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `📢 Announcement Updated:\n"${msg}"` });
       } else if (text === '/mode_pg') {
         await pool.query(`UPDATE app_config SET value = 'PHONEPE_PG' WHERE key = 'payment_mode'`);
-        await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `🔄 Switched to PHONEPE_PG mode!` });
+        await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `🔄 Switched to PHONEPE_PG!` });
       } else if (text === '/mode_upi') {
         await pool.query(`UPDATE app_config SET value = 'MANUAL_UPI' WHERE key = 'payment_mode'`);
-        await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `🔄 Switched to MANUAL_UPI mode!` });
+        await tgCall('sendMessage', { chat_id: ADMIN_CHAT_ID, text: `🔄 Switched to MANUAL_UPI!` });
       }
     }
   } catch (err) {
