@@ -12,8 +12,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || "").trim();
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'kavach_secret_2026';
 const PORT = process.env.PORT || 3000;
 
@@ -561,7 +561,7 @@ app.post('/telegram-webhook', async (req, res) => {
 
     if (update.message && String(update.message.from.id) === String(ADMIN_CHAT_ID)) {
       const text = update.message.text || '';
-      if (text === '/stats') {
+      if (text === '/stats' || text === '/stat') {
         const u = await pool.query('SELECT COUNT(*) FROM users');
         const f = await pool.query('SELECT COUNT(*) FROM families');
         const a = await pool.query(`SELECT COUNT(*) FROM subscriptions WHERE status = 'ACTIVE' AND valid_until > NOW()`);
@@ -589,6 +589,12 @@ app.post('/telegram-webhook', async (req, res) => {
   } catch (err) {
     console.error('Telegram webhook error:', err.message);
   }
+});
+
+
+app.get('/api/debug-bot', async (req, res) => {
+  const info = await tgCall('getWebhookInfo', {});
+  res.json({ hasToken: Boolean(BOT_TOKEN), adminChatIdLen: ADMIN_CHAT_ID.length, webhook: info });
 });
 
 app.listen(PORT, () => console.log(`Kavach Backend running on port ${PORT}`));
